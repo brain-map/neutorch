@@ -24,7 +24,7 @@ DEFAULT_PROBABILITY = .5
 DEFAULT_SHRINK_SIZE = (0, 0, 0, 0, 0, 0)
 # DEFAULT_SHRINK_SIZE = None
 
-
+# consider inherite from torchvision.transforms?
 class AbstractTransform(ABC):
     def __init__(self, 
             probability: float = DEFAULT_PROBABILITY,
@@ -364,14 +364,15 @@ class Flip(SpatialTransform):
 
     def transform(self, patch: Patch):
         axis_num = random.randint(1, 3)
-        axis = random.sample(range(3), axis_num)
-        # the image and label is 5d
-        # the first two axises are batch and channel
-        axis5d = tuple(2+x for x in axis)
-        patch.image.array = np.flip(patch.image.array, axis=axis5d)
-        patch.label.array = np.flip(patch.label.array, axis=axis5d)
+        axis4d = random.sample(range(1,4), axis_num)
+
+        # the image and label is 4d
+        # the first axis is channel
+        # the batch channel will be handled by the pytorch lightning
+        patch.image.array = np.flip(patch.image.array, axis=axis4d)
+        patch.label.array = np.flip(patch.label.array, axis=axis4d)
         if patch.has_mask:
-            patch.mask.array = np.flip(patch.mask.array, axis=axis5d)
+            patch.mask.array = np.flip(patch.mask.array, axis=axis4d)
 
         # shrink = list(patch.delayed_shrink_size)
         # for ax in axis:
@@ -390,21 +391,14 @@ class Transpose(SpatialTransform):
 
     def transform(self, patch: Patch):
         # only transform at XY
-        axis = [3,4]
+        axis = [2,3]
         random.shuffle(axis)
-        axis5d = (0, 1, 2, *axis,)
-        patch.image.array = np.transpose(patch.image.array, axis5d)
-        patch.label.array = np.transpose(patch.label.array, axis5d)
-        if patch.has_mask:
-            patch.mask.array = np.transpose(patch.mask.array, axis5d)
-
-        # shrink = list(patch.delayed_shrink_size)
-        # for ax0, ax1 in enumerate(axis):
-        #     ax1 -= 2
-        #     # swap the axis to be shrinked
-        #     shrink[ax0] = patch.delayed_shrink_size[ax1]
-        #     shrink[3+ax0] = patch.delayed_shrink_size[3+ax1]
-        # patch.delayed_shrink_size = tuple(shrink) 
+        if axis == [3,2]:
+            axis4d = (0, 1, *axis,)
+            patch.image.array = np.transpose(patch.image.array, axis4d)
+            patch.label.array = np.transpose(patch.label.array, axis4d)
+            if patch.has_mask:
+                patch.mask.array = np.transpose(patch.mask.array, axis4d)
         return patch
 
     
@@ -693,7 +687,7 @@ class Label2AffinityMap(SpatialTransform):
         """transform the label to affinity map."""
         assert patch.label.shape[0] == 1
         assert patch.label.shape[1] == 1
-        assert patch.label.ndim == 5
+        assert patch.label.ndim == 4
         seg = patch.label.array[0,0,...]
         seg = seg.astype(np.uint64)
         remove_contact_xy(seg)

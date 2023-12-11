@@ -6,6 +6,13 @@ import torch
 from chunkflow.lib.cartesian_coordinate import Cartesian
 from chunkflow.chunk import Chunk
 
+def expand_to_4d(arr: np.ndarray):
+    if arr.ndim == 4:
+        return arr
+    elif arr.ndim == 3:
+        return np.expand_dims(arr, axis=0)
+    else:
+        raise ValueError(f'only support array dimension of 3,4,5, but get {arr.ndim}')
 
 class Patch(object):
     def __init__(self, image: Chunk, label: Chunk,
@@ -24,8 +31,8 @@ class Patch(object):
             assert mask.ndim == 3
             assert mask.voxel_offset == image.voxel_offset
         
-        image.array = self._expand_to_5d(image.array)
-        label.array = self._expand_to_5d(label.array)
+        image.array = expand_to_4d(image.array)
+        label.array = expand_to_4d(label.array)
         
         self.image = image
         self.label = label
@@ -35,16 +42,7 @@ class Patch(object):
     def has_mask(self):
         return self.mask is not None
 
-    def _expand_to_5d(self, arr: np.ndarray):
-        if arr.ndim == 4:
-            arr = np.expand_dims(arr, axis=0)
-        elif arr.ndim == 3:
-            arr = np.expand_dims(arr, axis=(0,1))
-        elif arr.ndim == 5:
-            pass
-        else:
-            raise ValueError(f'only support array dimension of 3,4,5, but get {arr.ndim}')
-        return arr
+
 
     def shrink(self, size: tuple):
         self.image.shrink(size)

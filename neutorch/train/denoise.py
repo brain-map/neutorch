@@ -1,37 +1,25 @@
 #/bin/env python
 
-import os
 from functools import cached_property
 
 import click
 from yacs.config import CfgNode
+import torch
+
+import lightning.pytorch as pl
 
 from neutorch.data.dataset import VolumeWithMask
-from neutorch.train.base import TrainerBase, setup, cleanup
+from ..model.lightning import LitIsoRSUNet
 
-import torch
-import torch.distributed as dist
-from torch.distributed.elastic.multiprocessing.errors import record
-# torch.multiprocessing.set_start_method('spawn')
+from neutorch.data.dataset import load_cfg
 
-
-class WholeBrainTrainer(TrainerBase):
-    def __init__(self, cfg: CfgNode, 
-            device: torch.DeviceObjType=None,
-            local_rank: int = int(os.getenv('LOCAL_RANK', -1))
-        ) -> None:
-        super().__init__(cfg, device=device, local_rank=local_rank)
-        assert isinstance(cfg, CfgNode)
+class DenoiseModel(LitIsoRSUNet):
+    def __init__(self, cfg: CfgNode, model: torch.nn.Module = None) -> None:
+        super().__init__(cfg, model)
 
     @cached_property
-    def training_dataset(self):
-        return VolumeWithMask.from_config(self.cfg, mode='training')
-       
-    @cached_property
-    def validation_dataset(self):
-        return VolumeWithMask.from_config(self.cfg, mode='validation')
-
-
+    def loss_module(self):
+        return torch.nn.MSELoss() 
 
 @click.command()
 @click.option('--config-file', '-c',
@@ -39,23 +27,47 @@ class WholeBrainTrainer(TrainerBase):
     default='./config.yaml', 
     help = 'configuration file containing all the parameters.'
 )
-@click.option('--local-rank', '-r',
-    type=click.INT, default=int(os.getenv('LOCAL_RANK', -1)),
-    help='rank of local process. It is used to assign batches and GPU devices.'
-)
-@record
-def main(config_file: str, local_rank: int):
-    print(f'local rank: {local_rank}')
-    if local_rank != -1:
-        dist.init_process_group(backend="nccl", init_method='env://')
-        print(f'local rank of processes: {local_rank}')
-        torch.cuda.set_device(local_rank)
-        device=torch.device("cuda", local_rank)
-    else:
-        setup()
-
-    from neutorch.data.dataset import load_cfg
+@click.option('--devices', '-d', default="auto", 
+    help='number of devices')
+@click.option('--accelerator', '-a', type=click.Choice(['auto', 'gpu', 'cpu', 'cuda', 'hpu', 'ipu', 'mps', 'tpu']), default='auto',
+    help='accelerator to use, [auto, cpu, cuda, hpu, ipu, mps, tpu]')
+@click.option('--strategy', '-s', 
+    type=click.Choice(['ddp', 'ddp_spawn', 'auto']), default='auto')
+def main(config_file: str, devices: int, accelerator: str, strategy: str):
     cfg = load_cfg(config_file)
-    trainer = WholeBrainTrainer(cfg, device=device)
-    trainer()
-    cleanup()
+
+    training_dataset = VolumeWithMask.from_config(cfg, mode='training')
+    validation_dataset = VolumeWithMask.from_config(cfg, mode='validation')
+    
+    training_dataloader = torch.utils.data.DataLoader(
+        training_dataset,
+        batch_size=cfg.train.batch_size,
+        num_workers = 8,
+        # prefetch_factor=2,
+        drop_last=False,
+        multiprocessing_context='spawn',
+    )
+    validation_dataloader = torch.utils.data.DataLoader(
+        validation_dataset,
+        batch_size=cfg.train.batch_size,
+        num_workers = 8,
+        # prefetch_factor=2,
+        drop_last=False,
+        multiprocessing_context='spawn',
+    )
+    
+    # torch.distributed.init_process_group(backend="nccl")
+    trainer = pl.Trainer(
+        accelerator=accelerator, 
+        devices=devices, 
+        strategy=strategy
+    )
+
+    trainer.fit(
+        model = DenoiseModel(cfg), 
+        train_dataloaders = training_dataloader,
+        val_dataloaders = validation_dataloader,
+    )
+
+
+

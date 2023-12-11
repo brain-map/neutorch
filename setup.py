@@ -14,6 +14,7 @@ setup(
         [console_scripts]
         neutrain-sem=neutorch.train.semantic:main
         neutrain-organelle=neutorch.train.organelle:main
+        neutrain-mito=neutorch.train.mitochondria:main
         neutrain-pre=neutorch.train.pre_synapses:main
         neutrain-denoise=neutorch.train.denoise:main
         neutrain-post=neutorch.train.post_synapses:main

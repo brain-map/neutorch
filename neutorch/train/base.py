@@ -3,10 +3,14 @@ import random
 from abc import ABC, abstractproperty
 from functools import cached_property
 from time import time
+from typing import Any
+from lightning.pytorch.utilities.types import STEP_OUTPUT
 
 import numpy as np
 from yacs.config import CfgNode
 from chunkflow.lib.cartesian_coordinate import Cartesian
+
+import lightning.pytorch as pl
 
 import torch
 import torch.distributed as dist
@@ -18,33 +22,16 @@ from neutorch.model.io import load_chkpt, log_tensor, save_chkpt
 from neutorch.model.IsoRSUNet import Model
 from neutorch.data.dataset import worker_init_fn
 
-def setup():
-    # options: gloo, mpi, nccl
-    dist.init_process_group('nccl')
 
-def cleanup():
-    dist.destroy_process_group()
-
-class TrainerBase(ABC):
-    def __init__(self, cfg: CfgNode, 
-            device: torch.DeviceObjType = None,
-            local_rank: int = int(os.getenv('LOCAL_RANK', -1)),
-            ) -> None:
+class TrainerBase(pl.Trainer):
+    def __init__(self, cfg: CfgNode, **kwargs) -> None:
+        super().__init__(**kwargs)
         if isinstance(cfg, str) and os.path.exists(cfg):
             with open(cfg) as file:
                 cfg = CfgNode.load_cfg(file)
         cfg.freeze()
-        
-        if cfg.system.seed is not None:
-            random.seed(cfg.system.seed)
-        
+               
         self.cfg = cfg
-        self.device = device
-        self.local_rank = local_rank
-        if cfg.system.gpus < 0:
-            self.num_gpus = torch.cuda.device_count()
-        else:
-            self.num_gpus = cfg.system.gpus
         self.patch_size=Cartesian.from_collection(cfg.train.patch_size)
 
     @cached_property
@@ -102,31 +89,7 @@ class TrainerBase(ABC):
         if os.path.exists(fname) and self.local_rank==0:
             model = load_chkpt(model, fname)
 
-        model.to('cuda')
-        # note that we have to wrap the nn.DataParallel(model) before 
-        # loading the model since the dictionary is changed after the wrapping
-        if self.num_gpus > 1:
-            print(f'use {self.num_gpus} gpus!')
-            model = torch.nn.parallel.DistributedDataParallel(
-                model, 
-                device_ids=[self.local_rank],
-                output_device=self.local_rank)
-       
-        model = model.to('cuda')
-
         return model
-
-    @cached_property
-    def optimizer(self):
-        return torch.optim.Adam(
-            self.model.parameters(), 
-            lr=self.cfg.train.learning_rate
-        )
-
-
-    @cached_property
-    def loss_module(self):
-        return BinomialCrossEntropyWithLogits()
 
     @cached_property
     @abstractproperty
@@ -134,63 +97,21 @@ class TrainerBase(ABC):
         pass
 
     @cached_property
-    @abstractproperty
-    def validation_dataset(self):
-        pass
-    
-    @cached_property
-    def LOCAL_RANK(self):
-        return int(os.getenv('LOCAL_RANK', -1))
-    
-    @cached_property
-    def is_main_process(self):
-        return self.LOCAL_RANK <= 0
-       
-    @cached_property
     def training_data_loader(self):
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            self.training_dataset,
-            shuffle = False,
-        )
-        if self.cfg.system.cpus > 0:
-            #prefetch_factor = self.cfg.system.cpus
-            prefetch_factor = None
-            multiprocessing_context='spawn'
-        else:
-            prefetch_factor = None
-            multiprocessing_context=None
-
+        
         dataloader = torch.utils.data.DataLoader(
             self.training_dataset,
-            shuffle=False, 
-            num_workers = self.cfg.system.cpus,
-            prefetch_factor = prefetch_factor,
-            collate_fn=collate_batch,
-            worker_init_fn=worker_init_fn,
             batch_size=self.batch_size,
-            multiprocessing_context=multiprocessing_context,
-            # pin_memory = True, # only dense tensor can be pinned. To-Do: enable it.
-            sampler=sampler
         )
         return dataloader
 
     
     @cached_property
     def validation_data_loader(self):
-        sampler = torch.utils.data.distributed.DistributedSampler(
-            self.validation_dataset,
-            shuffle = False,
-        )
+        
         dataloader = torch.utils.data.DataLoader(
             self.validation_dataset,
-            shuffle=False, 
-            num_workers = self.cfg.system.cpus,
-            prefetch_factor = self.cfg.system.cpus,
-            collate_fn=collate_batch,
             batch_size=self.batch_size,
-            multiprocessing_context='spawn',
-            # pin_memory = True, # only dense tensor can be pinned. To-Do: enable it.
-            sampler=sampler
         )
         return dataloader
 
@@ -211,76 +132,3 @@ class TrainerBase(ABC):
             return torch.sigmoid(prediction)
         else:
             return prediction
-
-    def __call__(self) -> None:
-        writer = SummaryWriter(log_dir=self.cfg.train.output_dir)
-        accumulated_loss = 0.
-        iter_idx = self.cfg.train.iter_start
-
-        for iter_idx in range(self.cfg.train.iter_start, self.cfg.train.iter_stop):
-            image, label = next(iter(self.training_data_loader))
-        # for image, label in self.training_data_loader:
-            target = self.label_to_target(label)
-
-            # iter_idx += 1
-            # if iter_idx> self.cfg.train.iter_stop:
-            #     print('exceeds the maximum iteration: ', self.cfg.train.iter_stop)
-            #     return
-                
-
-            ping = time()
-            # print(f'preparing patch takes {round(time()-ping, 3)} seconds')
-            # image.to(self.device)
-            # self.model.to(self.device)
-            predict = self.model(image)
-            predict = self.post_processing(predict)
-            loss = self.loss_module(predict, target)
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            accumulated_loss += loss.tolist()
-            print(f'iteration {iter_idx} takes {round(time()-ping, 3)} seconds.')
-
-            if iter_idx % self.cfg.train.training_interval == 0 and self.is_main_process and iter_idx > 0:
-                per_voxel_loss = accumulated_loss / \
-                    self.cfg.train.training_interval / \
-                    self.voxel_num
-
-                print(f'training loss {round(per_voxel_loss, 3)}')
-                accumulated_loss = 0.
-                predict = self.post_processing(predict)
-                writer.add_scalar('Loss/train', per_voxel_loss, iter_idx)
-                log_tensor(writer, 'train/image', image, 'image', iter_idx)
-                log_tensor(writer, 'train/prediction', predict.detach(), 'image', iter_idx)
-                log_tensor(writer, 'train/target', target, 'image', iter_idx)
-
-            if iter_idx % self.cfg.train.validation_interval == 0 and self.is_main_process and \
-                    iter_idx > 0:
-
-                # only save model on master
-                fname = os.path.join(self.cfg.train.output_dir, \
-                    f'model_{iter_idx}.chkpt')
-                if iter_idx >= self.cfg.train.start_saving:
-                    print(f'save model to {fname}')
-                    save_chkpt(
-                        self.model, self.cfg.train.output_dir, \
-                        iter_idx, self.optimizer
-                    )
-
-                print('evaluate prediction: ')
-                validation_image, validation_label = next(iter(self.validation_data_iter))
-                validation_target = self.label_to_target(validation_label)
-
-                with torch.no_grad():
-                    validation_predict = self.model(validation_image)
-                    validation_loss = self.loss_module(validation_predict, validation_target)
-                    validation_predict = self.post_processing(validation_predict)
-                    per_voxel_loss = validation_loss.tolist() / self.voxel_num
-                    print(f'iter {iter_idx}: validation loss: {round(per_voxel_loss, 3)}')
-                    writer.add_scalar('Loss/validation', per_voxel_loss, iter_idx)
-                    log_tensor(writer, 'evaluate/image', validation_image, 'image', iter_idx)
-                    log_tensor(writer, 'evaluate/prediction', validation_predict, 'image', iter_idx)
-                    log_tensor(writer, 'evaluate/target', validation_target, 'image', iter_idx)
-
-        writer.close()
-        cleanup()

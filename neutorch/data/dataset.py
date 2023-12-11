@@ -66,8 +66,8 @@ def to_tensor(arr):
         elif np.issubdtype(arr.dtype, np.uint64):
             arr = arr.astype(np.int64)
         arr = torch.tensor(arr)
-    if torch.cuda.is_available():
-        arr = arr.cuda()
+    # if torch.cuda.is_available():
+    #     arr = arr.cuda()
     return arr
 
 
@@ -80,8 +80,42 @@ class DatasetBase(torch.utils.data.Dataset):
             patch_size (int or tuple): the patch size we are going to provide.
         """
         super().__init__()
+        print(f'got {len(samples)} samples.')
+        assert len(samples) > 0
         self.samples = samples
 
+    @classmethod
+    def from_config_v5(cls, 
+            sample_config_files: List[str], 
+            mode: str = 'training',
+            inputs = ['image'],
+            labels = ['label'],
+            output_patch_size: Cartesian = Cartesian(128, 128, 128),
+            ):
+
+        samples = []
+
+        for sample_config_file in sample_config_files:
+            sample_dir = os.path.dirname(sample_config_file)
+            sample_cfg = load_cfg(sample_config_file)
+            for sample_name, properties in sample_cfg.items():
+                if properties.mode != mode:
+                    print(f'skip {sample_name} with mode of {properties.mode} since current mode is {mode}')
+                    continue
+                sample = Sample.from_config_v5(
+                    properties,
+                    sample_dir,
+                    output_patch_size=output_patch_size,
+                    inputs = inputs,
+                    labels = labels,
+                )
+                if sample is not None:
+                    samples.append(sample)
+
+        return cls(samples)
+
+    def label_to_target(self, label: Chunk) -> Chunk:
+        return label
 
     @cached_property
     def sample_num(self):
@@ -123,7 +157,9 @@ class DatasetBase(torch.utils.data.Dataset):
     def __len__(self):
         patch_num = 0
         for sample in self.samples:
+            assert sample is not None
             patch_num += len(sample)
+        assert patch_num > 0
         return patch_num
 
     def __getitem__(self, index: int):
@@ -134,12 +170,12 @@ class DatasetBase(torch.utils.data.Dataset):
             index (int): index of the patch
         """
         image_chunk, label_chunk = self.random_patch
-        image = to_tensor(image_chunk.array)
-        label = to_tensor(label_chunk.array)
-
-        assert image.ndim == 5
-
-        return image, label
+        target_chunk = self.label_to_target(label_chunk)
+        
+        image_tensor = to_tensor(image_chunk.array)
+        target_tensor = to_tensor(target_chunk.array)
+        assert image_tensor.ndim == 4
+        return image_tensor, target_tensor
 
 class SemanticDataset(DatasetBase):
     def __init__(self, samples: list):
@@ -147,7 +183,7 @@ class SemanticDataset(DatasetBase):
         super().__init__(samples)
     
     @classmethod
-    def from_config(cls, cfg: CfgNode, is_train: bool, **kwargs):
+    def from_config(cls, cfg: CfgNode, is_train: bool = True, **kwargs):
         """Construct a semantic dataset with chunk or volume
 
         Args:
@@ -173,6 +209,11 @@ class SemanticDataset(DatasetBase):
 
         return cls( samples )
 
+    def label_to_target(self, label_chunk: Chunk) -> Chunk:
+        target_chunk = (label_chunk>0).astype(np.float32)
+        assert isinstance(target_chunk, Chunk)
+        # label = (label > 0).to(torch.float32)
+        return target_chunk
     
 
 class OrganelleDataset(SemanticDataset):
@@ -238,10 +279,6 @@ class OrganelleDataset(SemanticDataset):
     def __next__(self):
         # get numpy arrays of image and label
         image, label = self.random_patch
-        # if label.ndim == 5:
-        #     # the CrossEntropyLoss do not require channel axis
-        #     label = np.squeeze(label, axis=1)
-        
         # transform to PyTorch Tensor
         # transfer to device, e.g. GPU, automatically.
         image = to_tensor(image)
